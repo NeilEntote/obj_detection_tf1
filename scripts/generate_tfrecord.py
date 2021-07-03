@@ -1,133 +1,165 @@
-r"""Tool to export an object detection model for inference.
-Prepares an object detection tensorflow graph for inference using model
-configuration and a trained checkpoint. Outputs associated checkpoint files,
-a SavedModel, and a copy of the model config.
-The inference graph contains one of three input nodes depending on the user
-specified option.
-  * `image_tensor`: Accepts a uint8 4-D tensor of shape [1, None, None, 3]
-  * `float_image_tensor`: Accepts a float32 4-D tensor of shape
-    [1, None, None, 3]
-  * `encoded_image_string_tensor`: Accepts a 1-D string tensor of shape [None]
-    containing encoded PNG or JPEG images. Image resolutions are expected to be
-    the same if more than 1 image is provided.
-  * `tf_example`: Accepts a 1-D string tensor of shape [None] containing
-    serialized TFExample protos. Image resolutions are expected to be the same
-    if more than 1 image is provided.
-and the following output nodes returned by the model.postprocess(..):
-  * `num_detections`: Outputs float32 tensors of the form [batch]
-      that specifies the number of valid boxes per image in the batch.
-  * `detection_boxes`: Outputs float32 tensors of the form
-      [batch, num_boxes, 4] containing detected boxes.
-  * `detection_scores`: Outputs float32 tensors of the form
-      [batch, num_boxes] containing class scores for the detections.
-  * `detection_classes`: Outputs float32 tensors of the form
-      [batch, num_boxes] containing classes for the detections.
-Example Usage:
---------------
-python exporter_main_v2.py \
-    --input_type image_tensor \
-    --pipeline_config_path path/to/ssd_inception_v2.config \
-    --trained_checkpoint_dir path/to/checkpoint \
-    --output_directory path/to/exported_model_directory
-    --use_side_inputs True/False \
-    --side_input_shapes dim_0,dim_1,...dim_a/.../dim_0,dim_1,...,dim_z \
-    --side_input_names name_a,name_b,...,name_c \
-    --side_input_types type_1,type_2
-The expected output would be in the directory
-path/to/exported_model_directory (which is created if it does not exist)
-holding two subdirectories (corresponding to checkpoint and SavedModel,
-respectively) and a copy of the pipeline config.
-Config overrides (see the `config_override` flag) are text protobufs
-(also of type pipeline_pb2.TrainEvalPipelineConfig) which are used to override
-certain fields in the provided pipeline_config_path.  These are useful for
-making small changes to the inference graph that differ from the training or
-eval config.
-Example Usage (in which we change the second stage post-processing score
-threshold to be 0.5):
-python exporter_main_v2.py \
-    --input_type image_tensor \
-    --pipeline_config_path path/to/ssd_inception_v2.config \
-    --trained_checkpoint_dir path/to/checkpoint \
-    --output_directory path/to/exported_model_directory \
-    --config_override " \
-            model{ \
-              faster_rcnn { \
-                second_stage_post_processing { \
-                  batch_non_max_suppression { \
-                    score_threshold: 0.5 \
-                  } \
-                } \
-              } \
-            }"
-If side inputs are desired, the following arguments could be appended
-(the example below is for Context R-CNN).
-   --use_side_inputs True \
-   --side_input_shapes 1,2000,2057/1 \
-   --side_input_names context_features,valid_context_size \
-   --side_input_types tf.float32,tf.int32
+""" Sample TensorFlow XML-to-TFRecord converter
+usage: generate_tfrecord.py [-h] [-x XML_DIR] [-l LABELS_PATH] [-o OUTPUT_PATH] [-i IMAGE_DIR] [-c CSV_PATH]
+optional arguments:
+  -h, --help            show this help message and exit
+  -x XML_DIR, --xml_dir XML_DIR
+                        Path to the folder where the input .xml files are stored.
+  -l LABELS_PATH, --labels_path LABELS_PATH
+                        Path to the labels (.pbtxt) file.
+  -o OUTPUT_PATH, --output_path OUTPUT_PATH
+                        Path of output TFRecord (.record) file.
+  -i IMAGE_DIR, --image_dir IMAGE_DIR
+                        Path to the folder where the input image files are stored. Defaults to the same directory as XML_DIR.
+  -c CSV_PATH, --csv_path CSV_PATH
+                        Path of output .csv file. If none provided, then no file will be written.
 """
-from absl import app
-from absl import flags
 
-import tensorflow.compat.v2 as tf
-from google.protobuf import text_format
-from object_detection import exporter_lib_v2
-from object_detection.protos import pipeline_pb2
+import os
+import glob
+import pandas as pd
+import io
+import xml.etree.ElementTree as ET
+import argparse
 
-tf.enable_v2_behavior()
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'    # Suppress TensorFlow logging (1)
+import tensorflow.compat.v1 as tf
+from PIL import Image
+from object_detection.utils import dataset_util, label_map_util
+from collections import namedtuple
+
+# Initiate argument parser
+parser = argparse.ArgumentParser(
+    description="Sample TensorFlow XML-to-TFRecord converter")
+parser.add_argument("-x",
+                    "--xml_dir",
+                    help="Path to the folder where the input .xml files are stored.",
+                    type=str)
+parser.add_argument("-l",
+                    "--labels_path",
+                    help="Path to the labels (.pbtxt) file.", type=str)
+parser.add_argument("-o",
+                    "--output_path",
+                    help="Path of output TFRecord (.record) file.", type=str)
+parser.add_argument("-i",
+                    "--image_dir",
+                    help="Path to the folder where the input image files are stored. "
+                         "Defaults to the same directory as XML_DIR.",
+                    type=str, default=None)
+parser.add_argument("-c",
+                    "--csv_path",
+                    help="Path of output .csv file. If none provided, then no file will be "
+                         "written.",
+                    type=str, default=None)
+
+args = parser.parse_args()
+
+if args.image_dir is None:
+    args.image_dir = args.xml_dir
+
+label_map = label_map_util.load_labelmap(args.labels_path)
+label_map_dict = label_map_util.get_label_map_dict(label_map)
 
 
-FLAGS = flags.FLAGS
+def xml_to_csv(path):
+    """Iterates through all .xml files (generated by labelImg) in a given directory and combines
+    them in a single Pandas dataframe.
+    Parameters:
+    ----------
+    path : str
+        The path containing the .xml files
+    Returns
+    -------
+    Pandas DataFrame
+        The produced dataframe
+    """
 
-flags.DEFINE_string('input_type', 'image_tensor', 'Type of input node. Can be '
-                    'one of [`image_tensor`, `encoded_image_string_tensor`, '
-                    '`tf_example`, `float_image_tensor`]')
-flags.DEFINE_string('pipeline_config_path', None,
-                    'Path to a pipeline_pb2.TrainEvalPipelineConfig config '
-                    'file.')
-flags.DEFINE_string('trained_checkpoint_dir', None,
-                    'Path to trained checkpoint directory')
-flags.DEFINE_string('output_directory', None, 'Path to write outputs.')
-flags.DEFINE_string('config_override', '',
-                    'pipeline_pb2.TrainEvalPipelineConfig '
-                    'text proto to override pipeline_config_path.')
-flags.DEFINE_boolean('use_side_inputs', False,
-                     'If True, uses side inputs as well as image inputs.')
-flags.DEFINE_string('side_input_shapes', '',
-                    'If use_side_inputs is True, this explicitly sets '
-                    'the shape of the side input tensors to a fixed size. The '
-                    'dimensions are to be provided as a comma-separated list '
-                    'of integers. A value of -1 can be used for unknown '
-                    'dimensions. A `/` denotes a break, starting the shape of '
-                    'the next side input tensor. This flag is required if '
-                    'using side inputs.')
-flags.DEFINE_string('side_input_types', '',
-                    'If use_side_inputs is True, this explicitly sets '
-                    'the type of the side input tensors. The '
-                    'dimensions are to be provided as a comma-separated list '
-                    'of types, each of `string`, `integer`, or `float`. '
-                    'This flag is required if using side inputs.')
-flags.DEFINE_string('side_input_names', '',
-                    'If use_side_inputs is True, this explicitly sets '
-                    'the names of the side input tensors required by the model '
-                    'assuming the names will be a comma-separated list of '
-                    'strings. This flag is required if using side inputs.')
+    xml_list = []
+    for xml_file in glob.glob(path + '/*.xml'):
+        tree = ET.parse(xml_file)
+        root = tree.getroot()
+        for member in root.findall('object'):
+            value = (root.find('filename').text,
+                     int(root.find('size')[0].text),
+                     int(root.find('size')[1].text),
+                     member[0].text,
+                     int(member[4][0].text),
+                     int(member[4][1].text),
+                     int(member[4][2].text),
+                     int(member[4][3].text)
+                     )
+            xml_list.append(value)
+    column_name = ['filename', 'width', 'height',
+                   'class', 'xmin', 'ymin', 'xmax', 'ymax']
+    xml_df = pd.DataFrame(xml_list, columns=column_name)
+    return xml_df
 
-flags.mark_flag_as_required('pipeline_config_path')
-flags.mark_flag_as_required('trained_checkpoint_dir')
-flags.mark_flag_as_required('output_directory')
+
+def class_text_to_int(row_label):
+    return label_map_dict[row_label]
+
+
+def split(df, group):
+    data = namedtuple('data', ['filename', 'object'])
+    gb = df.groupby(group)
+    return [data(filename, gb.get_group(x)) for filename, x in zip(gb.groups.keys(), gb.groups)]
+
+
+def create_tf_example(group, path):
+    with tf.gfile.GFile(os.path.join(path, '{}'.format(group.filename)), 'rb') as fid:
+        encoded_jpg = fid.read()
+    encoded_jpg_io = io.BytesIO(encoded_jpg)
+    image = Image.open(encoded_jpg_io)
+    width, height = image.size
+
+    filename = group.filename.encode('utf8')
+    image_format = b'jpg'
+    xmins = []
+    xmaxs = []
+    ymins = []
+    ymaxs = []
+    classes_text = []
+    classes = []
+
+    for index, row in group.object.iterrows():
+        xmins.append(row['xmin'] / width)
+        xmaxs.append(row['xmax'] / width)
+        ymins.append(row['ymin'] / height)
+        ymaxs.append(row['ymax'] / height)
+        classes_text.append(row['class'].encode('utf8'))
+        classes.append(class_text_to_int(row['class']))
+
+    tf_example = tf.train.Example(features=tf.train.Features(feature={
+        'image/height': dataset_util.int64_feature(height),
+        'image/width': dataset_util.int64_feature(width),
+        'image/filename': dataset_util.bytes_feature(filename),
+        'image/source_id': dataset_util.bytes_feature(filename),
+        'image/encoded': dataset_util.bytes_feature(encoded_jpg),
+        'image/format': dataset_util.bytes_feature(image_format),
+        'image/object/bbox/xmin': dataset_util.float_list_feature(xmins),
+        'image/object/bbox/xmax': dataset_util.float_list_feature(xmaxs),
+        'image/object/bbox/ymin': dataset_util.float_list_feature(ymins),
+        'image/object/bbox/ymax': dataset_util.float_list_feature(ymaxs),
+        'image/object/class/text': dataset_util.bytes_list_feature(classes_text),
+        'image/object/class/label': dataset_util.int64_list_feature(classes),
+    }))
+    return tf_example
 
 
 def main(_):
-  pipeline_config = pipeline_pb2.TrainEvalPipelineConfig()
-  with tf.io.gfile.GFile(FLAGS.pipeline_config_path, 'r') as f:
-    text_format.Merge(f.read(), pipeline_config)
-  text_format.Merge(FLAGS.config_override, pipeline_config)
-  exporter_lib_v2.export_inference_graph(
-      FLAGS.input_type, pipeline_config, FLAGS.trained_checkpoint_dir,
-      FLAGS.output_directory, FLAGS.use_side_inputs, FLAGS.side_input_shapes,
-      FLAGS.side_input_types, FLAGS.side_input_names)
+
+    writer = tf.python_io.TFRecordWriter(args.output_path)
+    path = os.path.join(args.image_dir)
+    examples = xml_to_csv(args.xml_dir)
+    grouped = split(examples, 'filename')
+    for group in grouped:
+        tf_example = create_tf_example(group, path)
+        writer.write(tf_example.SerializeToString())
+    writer.close()
+    print('Successfully created the TFRecord file: {}'.format(args.output_path))
+    if args.csv_path is not None:
+        examples.to_csv(args.csv_path, index=None)
+        print('Successfully created the CSV file: {}'.format(args.csv_path))
 
 
 if __name__ == '__main__':
-  app.run(main)
+    tf.app.run()
