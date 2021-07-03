@@ -1,0 +1,26 @@
+<annotation>
+	<folder>images</folder>
+	<filename>cat.17.jpg</filename>
+	<path>C:\Neil\2nd Year\Research Intership\obj_detection_tf1\images\cat.17.jpg</path>
+	<source>
+		<database>Unknown</database>
+	</source>
+	<size>
+		<width>499</width>
+		<height>375</height>
+		<depth>3</depth>
+	</size>
+	<segmented>0</segmented>
+	<object>
+		<name>cat</name>
+		<pose>Unspecified</pose>
+		<truncated>0</truncated>
+		<difficult>0</difficult>
+		<bndbox>
+			<xmin>96</xmin>
+			<ymin>62</ymin>
+			<xmax>422</xmax>
+			<ymax>345</ymax>
+		</bndbox>
+	</object>
+</annotation>
